@@ -1,0 +1,859 @@
+name: Jingu Hub v1.0.0 Hardened Final Native Matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_ZIP: JinguHub_v1.0.0_RELEASE_HARDENED_CANDIDATE.zip
+  CANDIDATE_SHA256: 58ca72b11d3c14b3b5ce99471ffeed0cbee395dd4ab1b9ceb9b90b8fb0616425
+  NODE_VERSION: "22"
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  windows-x64:
+    name: Windows x64 · Hardened native qualification
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compile repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract hardened candidate
+        shell: python
+        run: |
+          import hashlib, os, shutil, sys, zipfile
+          from pathlib import Path
+
+          zpath = Path(os.environ["CANDIDATE_ZIP"])
+          expected = os.environ["CANDIDATE_SHA256"].lower()
+          if not zpath.is_file():
+              raise SystemExit(f"Candidate ZIP not found: {zpath}")
+
+          actual = hashlib.sha256(zpath.read_bytes()).hexdigest()
+          print("candidate sha256 =", actual)
+          if actual != expected:
+              raise SystemExit(f"SHA-256 mismatch: expected {expected}, got {actual}")
+
+          out = Path("work")
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir()
+
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+              zf.extractall(out)
+
+          hub = out / "Hub"
+          if not (hub / "package.json").is_file():
+              raise SystemExit("Hub/package.json missing after extraction")
+          print("Hardened candidate extracted to", hub)
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: work/Hub/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: work/Hub/src-tauri -> target
+
+      - name: Self-contained Hub QA
+        shell: powershell
+        working-directory: work/Hub
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/validate-source-manifest.py
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run validate:i18n
+          npm run test:frontend-domain
+          npm run typecheck
+          python scripts/validate-project-layout.py --root ..
+          python scripts/validate-source-headers.py
+          node scripts/validate-tauri-config.mjs --platform win32
+          node scripts/validate-cargo-lock.mjs
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+          cargo test --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          python scripts/validate-source-manifest.py
+
+      - name: Verify self-contained unified contracts
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import re, subprocess, sys
+
+          expected_external = [
+              "Freelancer schema 5 stays canonical while legacy contracts are adapted non-destructively",
+              "Community requests use private Continuity random IDs and public community rows support newest-first timestamps",
+              "Freelancer reports self-provision moderation labels and no bootstrap workflow is required",
+              "Membership and routed payments use durable GitHub IDs, explicit lifetime persistence and verified idempotent provider fulfillment",
+              "Credits history, currency routing and latency guards remain explicit and fail closed",
+              "FinalSyncRepair removes Freelancer mirror race by publishing only after label reconciliation",
+              "FinalSyncRepair makes explicit Community refresh source-of-truth first and approval sync immediate",
+              "FinalSyncPrivacyRepair enforces checkout allowlist and minimizes staff payment surface",
+              "FinalSyncArchiveRepair uses auditable safe filenames while preserving legacy retry paths",
+          ]
+
+          p = subprocess.run(
+              ["node", "--test", "tests/unified_access_contract.test.mjs"],
+              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          print(p.stdout)
+
+          passed = re.search(r"(?:^|\n)[^\n]*pass\s+54(?:\D|$)", p.stdout)
+          failed = re.search(r"(?:^|\n)[^\n]*fail\s+9(?:\D|$)", p.stdout)
+          missing = [name for name in expected_external if name not in p.stdout]
+          if p.returncode == 0 or not passed or not failed or missing:
+              raise SystemExit(
+                  "Unified contracts did not match the audited Hub-only boundary. "
+                  f"returncode={p.returncode}; missing_expected={missing}"
+              )
+          print("54 self-contained contract tests PASS; 9 monorepo/server-side contracts remain PENDING_NOT_RUN by design.")
+
+      - name: Build Windows x64 packages
+        shell: powershell
+        working-directory: work/Hub
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\build-hub-windows.ps1 -Clean -LogPath ".\build-hub-final.log"
+          python scripts/validate-source-manifest.py
+
+      - name: Verify Windows x64 binary architecture
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import struct, zipfile
+          from pathlib import Path
+
+          def pe_machine(data: bytes) -> int:
+              if data[:2] != b"MZ":
+                  raise SystemExit("Missing MZ header")
+              off = struct.unpack_from("<I", data, 0x3C)[0]
+              if data[off:off+4] != b"PE\0\0":
+                  raise SystemExit("Missing PE header")
+              return struct.unpack_from("<H", data, off + 4)[0]
+
+          exe = Path("src-tauri/target/release/jingu-hub.exe")
+          if not exe.is_file():
+              exe = Path("src-tauri/target/release/jingu_hub.exe")
+          if pe_machine(exe.read_bytes()) != 0x8664:
+              raise SystemExit("Release binary is not Windows x64")
+
+          zips = sorted(Path("Exports/Unified/Windows").glob("*win64.zip"))
+          setups = sorted(Path("Exports/Unified/Windows").glob("*win64-setup.exe"))
+          if len(zips) != 1 or len(setups) != 1:
+              raise SystemExit(f"Expected one win64 portable ZIP and one setup; got zips={zips}, setups={setups}")
+
+          with zipfile.ZipFile(zips[0]) as zf:
+              data = zf.read("JinguHub.exe")
+          if pe_machine(data) != 0x8664:
+              raise SystemExit("Portable JinguHub.exe is not Windows x64")
+          print("Windows x64 architecture verified.")
+
+      - name: Upload Windows x64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JinguHub-Hardened-Windows-x64
+          path: work/Hub/Exports/Unified/Windows
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-arm64:
+    name: Windows ARM64 · Hardened native qualification
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compile repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract hardened candidate
+        shell: python
+        run: |
+          import hashlib, os, shutil, zipfile
+          from pathlib import Path
+
+          zpath = Path(os.environ["CANDIDATE_ZIP"])
+          expected = os.environ["CANDIDATE_SHA256"].lower()
+          if not zpath.is_file():
+              raise SystemExit(f"Candidate ZIP not found: {zpath}")
+          actual = hashlib.sha256(zpath.read_bytes()).hexdigest()
+          print("candidate sha256 =", actual)
+          if actual != expected:
+              raise SystemExit(f"SHA-256 mismatch: expected {expected}, got {actual}")
+
+          out = Path("work")
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir()
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+              zf.extractall(out)
+
+          if not (out / "Hub" / "package.json").is_file():
+              raise SystemExit("Hub/package.json missing after extraction")
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: work/Hub/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: work/Hub/src-tauri -> target
+
+      - name: Self-contained Hub QA
+        shell: powershell
+        working-directory: work/Hub
+        run: |
+          $ErrorActionPreference = "Stop"
+          python scripts/validate-source-manifest.py
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run validate:i18n
+          npm run test:frontend-domain
+          npm run typecheck
+          python scripts/validate-project-layout.py --root ..
+          python scripts/validate-source-headers.py
+          node scripts/validate-tauri-config.mjs --platform win32
+          node scripts/validate-cargo-lock.mjs
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+          cargo test --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          python scripts/validate-source-manifest.py
+
+      - name: Verify self-contained unified contracts
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import re, subprocess
+
+          expected_external = [
+              "Freelancer schema 5 stays canonical while legacy contracts are adapted non-destructively",
+              "Community requests use private Continuity random IDs and public community rows support newest-first timestamps",
+              "Freelancer reports self-provision moderation labels and no bootstrap workflow is required",
+              "Membership and routed payments use durable GitHub IDs, explicit lifetime persistence and verified idempotent provider fulfillment",
+              "Credits history, currency routing and latency guards remain explicit and fail closed",
+              "FinalSyncRepair removes Freelancer mirror race by publishing only after label reconciliation",
+              "FinalSyncRepair makes explicit Community refresh source-of-truth first and approval sync immediate",
+              "FinalSyncPrivacyRepair enforces checkout allowlist and minimizes staff payment surface",
+              "FinalSyncArchiveRepair uses auditable safe filenames while preserving legacy retry paths",
+          ]
+          p = subprocess.run(
+              ["node", "--test", "tests/unified_access_contract.test.mjs"],
+              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          print(p.stdout)
+          passed = re.search(r"(?:^|\n)[^\n]*pass\s+54(?:\D|$)", p.stdout)
+          failed = re.search(r"(?:^|\n)[^\n]*fail\s+9(?:\D|$)", p.stdout)
+          missing = [name for name in expected_external if name not in p.stdout]
+          if p.returncode == 0 or not passed or not failed or missing:
+              raise SystemExit(
+                  "Unified contracts did not match the audited Hub-only boundary. "
+                  f"returncode={p.returncode}; missing_expected={missing}"
+              )
+          print("54 self-contained contract tests PASS; 9 monorepo/server-side contracts remain PENDING_NOT_RUN by design.")
+
+      - name: Build Windows ARM64 packages
+        shell: powershell
+        working-directory: work/Hub
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\build-hub-windows.ps1 -Clean -LogPath ".\build-hub-final.log"
+          python scripts/validate-source-manifest.py
+
+      - name: Verify Windows ARM64 binary architecture
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import struct, zipfile
+          from pathlib import Path
+
+          def pe_machine(data: bytes) -> int:
+              if data[:2] != b"MZ":
+                  raise SystemExit("Missing MZ header")
+              off = struct.unpack_from("<I", data, 0x3C)[0]
+              if data[off:off+4] != b"PE\0\0":
+                  raise SystemExit("Missing PE header")
+              return struct.unpack_from("<H", data, off + 4)[0]
+
+          exe = Path("src-tauri/target/release/jingu-hub.exe")
+          if not exe.is_file():
+              exe = Path("src-tauri/target/release/jingu_hub.exe")
+          if pe_machine(exe.read_bytes()) != 0xAA64:
+              raise SystemExit("Release binary is not Windows ARM64")
+
+          zips = sorted(Path("Exports/Unified/Windows").glob("*winarm64.zip"))
+          setups = sorted(Path("Exports/Unified/Windows").glob("*winarm64-setup.exe"))
+          if len(zips) != 1 or len(setups) != 1:
+              raise SystemExit(f"Expected one winarm64 portable ZIP and one setup; got zips={zips}, setups={setups}")
+
+          with zipfile.ZipFile(zips[0]) as zf:
+              data = zf.read("JinguHub.exe")
+          if pe_machine(data) != 0xAA64:
+              raise SystemExit("Portable JinguHub.exe is not Windows ARM64")
+          print("Windows ARM64 architecture verified.")
+
+      - name: Upload Windows ARM64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JinguHub-Hardened-Windows-ARM64
+          path: work/Hub/Exports/Unified/Windows
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-x64:
+    name: Linux x64 · Hardened native qualification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compile repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract hardened candidate
+        shell: python
+        run: |
+          import hashlib, os, shutil, zipfile
+          from pathlib import Path
+
+          zpath = Path(os.environ["CANDIDATE_ZIP"])
+          expected = os.environ["CANDIDATE_SHA256"].lower()
+          if not zpath.is_file():
+              raise SystemExit(f"Candidate ZIP not found: {zpath}")
+          actual = hashlib.sha256(zpath.read_bytes()).hexdigest()
+          print("candidate sha256 =", actual)
+          if actual != expected:
+              raise SystemExit(f"SHA-256 mismatch: expected {expected}, got {actual}")
+
+          out = Path("work")
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir()
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+              zf.extractall(out)
+
+          if not (out / "Hub" / "package.json").is_file():
+              raise SystemExit("Hub/package.json missing after extraction")
+
+      - name: Install Linux/Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libxdo-dev \
+            rpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: work/Hub/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: work/Hub/src-tauri -> target
+
+      - name: Self-contained Hub QA
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-source-manifest.py
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run validate:i18n
+          npm run test:frontend-domain
+          npm run typecheck
+          python3 scripts/validate-project-layout.py --root ..
+          python3 scripts/validate-source-headers.py
+          node scripts/validate-tauri-config.mjs --platform linux
+          node scripts/validate-cargo-lock.mjs
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+          cargo test --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          python3 scripts/validate-source-manifest.py
+
+      - name: Verify self-contained unified contracts
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import re, subprocess
+
+          expected_external = [
+              "Freelancer schema 5 stays canonical while legacy contracts are adapted non-destructively",
+              "Community requests use private Continuity random IDs and public community rows support newest-first timestamps",
+              "Freelancer reports self-provision moderation labels and no bootstrap workflow is required",
+              "Membership and routed payments use durable GitHub IDs, explicit lifetime persistence and verified idempotent provider fulfillment",
+              "Credits history, currency routing and latency guards remain explicit and fail closed",
+              "FinalSyncRepair removes Freelancer mirror race by publishing only after label reconciliation",
+              "FinalSyncRepair makes explicit Community refresh source-of-truth first and approval sync immediate",
+              "FinalSyncPrivacyRepair enforces checkout allowlist and minimizes staff payment surface",
+              "FinalSyncArchiveRepair uses auditable safe filenames while preserving legacy retry paths",
+          ]
+          p = subprocess.run(
+              ["node", "--test", "tests/unified_access_contract.test.mjs"],
+              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          print(p.stdout)
+          passed = re.search(r"(?:^|\n)[^\n]*pass\s+54(?:\D|$)", p.stdout)
+          failed = re.search(r"(?:^|\n)[^\n]*fail\s+9(?:\D|$)", p.stdout)
+          missing = [name for name in expected_external if name not in p.stdout]
+          if p.returncode == 0 or not passed or not failed or missing:
+              raise SystemExit(
+                  "Unified contracts did not match the audited Hub-only boundary. "
+                  f"returncode={p.returncode}; missing_expected={missing}"
+              )
+          print("54 self-contained contract tests PASS; 9 monorepo/server-side contracts remain PENDING_NOT_RUN by design.")
+
+      - name: Build and package Linux x64
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          npm run build
+          npm run validate:bundle
+          npm run tauri:build
+          python3 scripts/validate-source-manifest.py
+
+          VERSION="$(node -p "require('./package.json').version")"
+          CHANNEL="$(node -p "require('./release-profile.json').channel")"
+          OUT="Exports/Unified/Linux"
+          mkdir -p "$OUT"
+
+          BIN="src-tauri/target/release/jingu-hub"
+          [[ -x "$BIN" ]] || BIN="src-tauri/target/release/jingu_hub"
+          [[ -x "$BIN" ]] || { echo "Linux release executable not found"; exit 1; }
+
+          TMP=".jingu-build/portable-linux64"
+          rm -rf "$TMP"
+          mkdir -p "$TMP"
+          cp "$BIN" "$TMP/JinguHub"
+          printf 'Jingu Hub portable mode\n' > "$TMP/portable.flag"
+          tar -C "$TMP" -czf "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linux64.tar.gz" .
+
+          DEB="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' 2>/dev/null | head -1 || true)"
+          RPM="$(find src-tauri/target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' 2>/dev/null | head -1 || true)"
+          [[ -n "$DEB" ]] || { echo "DEB not generated"; exit 1; }
+          [[ -n "$RPM" ]] || { echo "RPM not generated"; exit 1; }
+          cp "$DEB" "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linux64.deb"
+          cp "$RPM" "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linux64.rpm"
+
+      - name: Verify Linux x64 architecture and packages
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          BIN="src-tauri/target/release/jingu-hub"
+          [[ -x "$BIN" ]] || BIN="src-tauri/target/release/jingu_hub"
+          file "$BIN"
+          file "$BIN" | grep -Eq 'ELF 64-bit.*x86-64|ELF 64-bit.*x86_64'
+          DEB="$(find Exports/Unified/Linux -maxdepth 1 -name '*linux64.deb' -print -quit)"
+          RPM="$(find Exports/Unified/Linux -maxdepth 1 -name '*linux64.rpm' -print -quit)"
+          test "$(dpkg-deb -f "$DEB" Architecture)" = "amd64"
+          test "$(rpm -qp --qf '%{ARCH}' "$RPM")" = "x86_64"
+          ls -lah Exports/Unified/Linux
+
+      - name: Upload Linux x64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JinguHub-Hardened-Linux-x64
+          path: work/Hub/Exports/Unified/Linux
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-arm64:
+    name: Linux ARM64 · Hardened native qualification
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout compile repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify and extract hardened candidate
+        shell: python
+        run: |
+          import hashlib, os, shutil, zipfile
+          from pathlib import Path
+
+          zpath = Path(os.environ["CANDIDATE_ZIP"])
+          expected = os.environ["CANDIDATE_SHA256"].lower()
+          if not zpath.is_file():
+              raise SystemExit(f"Candidate ZIP not found: {zpath}")
+          actual = hashlib.sha256(zpath.read_bytes()).hexdigest()
+          print("candidate sha256 =", actual)
+          if actual != expected:
+              raise SystemExit(f"SHA-256 mismatch: expected {expected}, got {actual}")
+
+          out = Path("work")
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir()
+          with zipfile.ZipFile(zpath) as zf:
+              for info in zf.infolist():
+                  name = info.filename.replace("\\", "/")
+                  parts = [p for p in name.split("/") if p not in ("", ".")]
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"Unsafe ZIP path: {name}")
+              zf.extractall(out)
+
+          if not (out / "Hub" / "package.json").is_file():
+              raise SystemExit("Hub/package.json missing after extraction")
+
+      - name: Install Linux/Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libxdo-dev \
+            rpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: work/Hub/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy,rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: work/Hub/src-tauri -> target
+
+      - name: Self-contained Hub QA
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-source-manifest.py
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=high
+          npm run validate:i18n
+          npm run test:frontend-domain
+          npm run typecheck
+          python3 scripts/validate-project-layout.py --root ..
+          python3 scripts/validate-source-headers.py
+          node scripts/validate-tauri-config.mjs --platform linux
+          node scripts/validate-cargo-lock.mjs
+          cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check
+          cargo check --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          cargo clippy --locked --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+          cargo test --locked --all-targets --manifest-path src-tauri/Cargo.toml
+          python3 scripts/validate-source-manifest.py
+
+      - name: Verify self-contained unified contracts
+        shell: python
+        working-directory: work/Hub
+        run: |
+          import re, subprocess
+
+          expected_external = [
+              "Freelancer schema 5 stays canonical while legacy contracts are adapted non-destructively",
+              "Community requests use private Continuity random IDs and public community rows support newest-first timestamps",
+              "Freelancer reports self-provision moderation labels and no bootstrap workflow is required",
+              "Membership and routed payments use durable GitHub IDs, explicit lifetime persistence and verified idempotent provider fulfillment",
+              "Credits history, currency routing and latency guards remain explicit and fail closed",
+              "FinalSyncRepair removes Freelancer mirror race by publishing only after label reconciliation",
+              "FinalSyncRepair makes explicit Community refresh source-of-truth first and approval sync immediate",
+              "FinalSyncPrivacyRepair enforces checkout allowlist and minimizes staff payment surface",
+              "FinalSyncArchiveRepair uses auditable safe filenames while preserving legacy retry paths",
+          ]
+          p = subprocess.run(
+              ["node", "--test", "tests/unified_access_contract.test.mjs"],
+              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+          )
+          print(p.stdout)
+          passed = re.search(r"(?:^|\n)[^\n]*pass\s+54(?:\D|$)", p.stdout)
+          failed = re.search(r"(?:^|\n)[^\n]*fail\s+9(?:\D|$)", p.stdout)
+          missing = [name for name in expected_external if name not in p.stdout]
+          if p.returncode == 0 or not passed or not failed or missing:
+              raise SystemExit(
+                  "Unified contracts did not match the audited Hub-only boundary. "
+                  f"returncode={p.returncode}; missing_expected={missing}"
+              )
+          print("54 self-contained contract tests PASS; 9 monorepo/server-side contracts remain PENDING_NOT_RUN by design.")
+
+      - name: Build and package Linux ARM64
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          npm run build
+          npm run validate:bundle
+          npm run tauri:build
+          python3 scripts/validate-source-manifest.py
+
+          VERSION="$(node -p "require('./package.json').version")"
+          CHANNEL="$(node -p "require('./release-profile.json').channel")"
+          OUT="Exports/Unified/Linux"
+          mkdir -p "$OUT"
+
+          BIN="src-tauri/target/release/jingu-hub"
+          [[ -x "$BIN" ]] || BIN="src-tauri/target/release/jingu_hub"
+          [[ -x "$BIN" ]] || { echo "Linux release executable not found"; exit 1; }
+
+          TMP=".jingu-build/portable-linuxarm64"
+          rm -rf "$TMP"
+          mkdir -p "$TMP"
+          cp "$BIN" "$TMP/JinguHub"
+          printf 'Jingu Hub portable mode\n' > "$TMP/portable.flag"
+          tar -C "$TMP" -czf "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linuxarm64.tar.gz" .
+
+          DEB="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' 2>/dev/null | head -1 || true)"
+          RPM="$(find src-tauri/target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' 2>/dev/null | head -1 || true)"
+          [[ -n "$DEB" ]] || { echo "DEB not generated"; exit 1; }
+          [[ -n "$RPM" ]] || { echo "RPM not generated"; exit 1; }
+          cp "$DEB" "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linuxarm64.deb"
+          cp "$RPM" "$OUT/JinguHub_v${VERSION}-${CHANNEL}_linuxarm64.rpm"
+
+      - name: Verify Linux ARM64 architecture and packages
+        shell: bash
+        working-directory: work/Hub
+        run: |
+          set -euo pipefail
+          BIN="src-tauri/target/release/jingu-hub"
+          [[ -x "$BIN" ]] || BIN="src-tauri/target/release/jingu_hub"
+          file "$BIN"
+          file "$BIN" | grep -Eq 'ELF 64-bit.*ARM aarch64|ELF 64-bit.*aarch64'
+          DEB="$(find Exports/Unified/Linux -maxdepth 1 -name '*linuxarm64.deb' -print -quit)"
+          RPM="$(find Exports/Unified/Linux -maxdepth 1 -name '*linuxarm64.rpm' -print -quit)"
+          test "$(dpkg-deb -f "$DEB" Architecture)" = "arm64"
+          test "$(rpm -qp --qf '%{ARCH}' "$RPM")" = "aarch64"
+          ls -lah Exports/Unified/Linux
+
+      - name: Upload Linux ARM64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JinguHub-Hardened-Linux-ARM64
+          path: work/Hub/Exports/Unified/Linux
+          if-no-files-found: error
+          retention-days: 14
+
+  collect-release-candidate:
+    name: Assemble final hardened release candidate
+    runs-on: ubuntu-22.04
+    needs: [windows-x64, windows-arm64, linux-x64, linux-arm64]
+    if: ${{ always() && needs.windows-x64.result == 'success' && needs.windows-arm64.result == 'success' && needs.linux-x64.result == 'success' && needs.linux-arm64.result == 'success' }}
+    steps:
+      - name: Checkout compile repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download Windows x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JinguHub-Hardened-Windows-x64
+          path: _artifacts/windows-x64
+
+      - name: Download Windows ARM64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JinguHub-Hardened-Windows-ARM64
+          path: _artifacts/windows-arm64
+
+      - name: Download Linux x64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JinguHub-Hardened-Linux-x64
+          path: _artifacts/linux-x64
+
+      - name: Download Linux ARM64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: JinguHub-Hardened-Linux-ARM64
+          path: _artifacts/linux-arm64
+
+      - name: Assemble files, provenance and checksums
+        shell: python
+        run: |
+          import hashlib, json, os, shutil
+          from pathlib import Path
+
+          root = Path(".")
+          out = root / "Release"
+          shutil.rmtree(out, ignore_errors=True)
+          out.mkdir()
+
+          groups = [
+              ("Windows x64", root / "_artifacts/windows-x64"),
+              ("Windows ARM64", root / "_artifacts/windows-arm64"),
+              ("Linux x64", root / "_artifacts/linux-x64"),
+              ("Linux ARM64", root / "_artifacts/linux-arm64"),
+          ]
+
+          seen = set()
+          grouped_names = []
+          for title, src in groups:
+              names = []
+              for p in sorted(src.rglob("*")):
+                  if not p.is_file():
+                      continue
+                  name = p.name
+                  if name in seen:
+                      raise SystemExit(f"Duplicate release filename: {name}")
+                  seen.add(name)
+                  shutil.copy2(p, out / name)
+                  names.append(name)
+              if not names:
+                  raise SystemExit(f"No files found for {title}")
+              grouped_names.append((title, names))
+
+          public_files = sorted(p for p in out.iterdir() if p.is_file())
+
+          sha_lines = []
+          for p in public_files:
+              digest = hashlib.sha512(p.read_bytes()).hexdigest()
+              sha_lines.append(f"{digest}  {p.name}")
+          (out / "SHA512-SUMS.txt").write_text("\n".join(sha_lines) + "\n", encoding="ascii")
+
+          md = [
+              "# Jingu Hub v1.0.0 — SHA-512 Checksums",
+              "",
+              "Generated from the four native hardened CI targets.",
+              "",
+          ]
+          for title, names in grouped_names:
+              md += [f"## {title}", ""]
+              for name in names:
+                  p = out / name
+                  digest = hashlib.sha512(p.read_bytes()).hexdigest()
+                  md += [f"`{name}`", "", f"`SHA-512: {digest}`", ""]
+          (out / "CHECKSUMS.md").write_text("\n".join(md), encoding="utf-8")
+
+          candidate = root / os.environ["CANDIDATE_ZIP"]
+          if not candidate.is_file():
+              raise SystemExit(f"Candidate ZIP missing in collector: {candidate}")
+          source_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+          if source_sha != os.environ["CANDIDATE_SHA256"].lower():
+              raise SystemExit("Collector source candidate hash mismatch")
+
+          provenance = {
+              "schema": 1,
+              "product": "Jingu Hub",
+              "version": "1.0.0",
+              "channel": "stable",
+              "source_candidate": candidate.name,
+              "source_candidate_sha256": source_sha,
+              "github_repository": os.environ.get("GITHUB_REPOSITORY", ""),
+              "github_sha": os.environ.get("GITHUB_SHA", ""),
+              "native_targets": [
+                  "windows-x64",
+                  "windows-arm64",
+                  "linux-x64-ubuntu-22.04",
+                  "linux-arm64-ubuntu-22.04",
+              ],
+              "qualification_scope": {
+                  "hub_native_builds": "PASS if this collector runs",
+                  "monorepo_infrastructure_manager_contracts": "PENDING_NOT_RUN in this Hub-only repository",
+                  "server_side_payment_worker_db": "NOT_IN_SCOPE",
+                  "gui_e2e_and_real_engine_download": "PENDING_NOT_RUN",
+              },
+          }
+          (out / "JINGU_CI_PROVENANCE.json").write_text(
+              json.dumps(provenance, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+
+          scope = (
+              "Jingu Hub v1.0.0 Hardened Native Qualification\n\n"
+              "PASS if this aggregate artifact exists:\n"
+              "- Windows x64 native QA/build/package\n"
+              "- Windows ARM64 native QA/build/package\n"
+              "- Linux x64 native QA/build/package on Ubuntu 22.04\n"
+              "- Linux ARM64 native QA/build/package on Ubuntu 22.04\n"
+              "- architecture checks for release binaries/packages\n"
+              "- source manifest, Rust, frontend and self-contained Hub QA gates\n\n"
+              "Intentionally not claimed by this Hub-only workflow:\n"
+              "- the 9 monorepo contracts that require Infrastructure/ and/or Manager/\n"
+              "- server-side Worker/D1/payment fulfillment correctness\n"
+              "- GUI E2E with a real user account/keyring\n"
+              "- real Jingu Engine release download/install/run\n"
+              "- Authenticode/code-signing status\n"
+          )
+          (out / "QUALIFICATION_SCOPE.txt").write_text(scope, encoding="utf-8")
+
+          print("\nFinal release candidate files:")
+          for p in sorted(out.iterdir()):
+              if p.is_file():
+                  print(f" - {p.name} ({p.stat().st_size} bytes)")
+
+      - name: Upload aggregate hardened release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: JinguHub-v1.0.0-Hardened-Final-Release-Candidate
+          path: Release
+          if-no-files-found: error
+          retention-days: 14
